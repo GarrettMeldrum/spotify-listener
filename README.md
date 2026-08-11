@@ -89,13 +89,3 @@ docker run -d \
 ```
 
 Mounting `/app/data` persists both the SQLite database and the OAuth token cache across container restarts.
-
-## Roadmap
-
-- Dashboard for visualizing listening history on a personal website
-- Real-time streaming of new plays to the front end
-- More robust retry and backoff handling for API errors
-
-## License
-
-MIT. See [LICENSE](LICENSE).
