@@ -1,55 +1,101 @@
-# *Spotify API ETL Pipeline: Dashboard + Real-Time React Streaming*
+# Spotify Listener
 
-Introduction: After discovering the Spotify API and more specifically the recent listens endpoint of the API, I knew I wanted to store this information with a script and run analytics on it to dashboard to my personal website. I had done a bit of exploring online and could not find anything similar to gain inspiration from. So, I dove into the documentation and from there, began structuring how the project should be handled. This script will be containerized in a docker env that is hosted on my homelab.
+A lightweight ETL service that polls the Spotify API for your recently played tracks and stores them in a normalized SQLite database. Built to run continuously in a container, laying the groundwork for a personal listening-history dashboard.
 
-## 1. Spotify API connection with Spotipy
+## Overview
 
-The spotify API is wrapped by a library in Python called Spotipy, for readability purposes, we are going to use Spotipy to authenicate, connect, and pull data from the API. This is done with the following snippets of code:
+Spotify's API doesn't retain your play history, and its "recently played" endpoint only returns the last 50 tracks. This project closes that gap: a small Python service authenticates with Spotify via [Spotipy](https://spotipy.readthedocs.io/), polls the API every 30 seconds, and persists any new plays to a local SQLite database with proper relational structure for tracks, albums, and artists (including multi-artist tracks).
 
-<img width="613" height="329" alt="image" src="https://github.com/user-attachments/assets/3f897a59-4aff-4dca-bbac-efc3e9863bff" />
-<br></br>
+## How it works
 
-This code snippet first, loads in our secrets stored in the .ENV file, this is done to not expose my spotify API credentials while hosting this on Github. By following the .ENV.example file, it will walk you through through the items needed to generate a personal .ENV to run this script. Once that exists, the authenticate with your credentials.
+1. **Authenticate** with the Spotify API using OAuth (`user-read-recently-played` scope), with the token cached to disk so re-authentication isn't required on every restart.
+2. **Poll** the `current_user_recently_played` endpoint every 30 seconds.
+3. **Deduplicate** by comparing each item's `played_at` timestamp against the most recent timestamp already stored, so only new plays are processed.
+4. **Insert** the album, artists, and track into their respective tables, then link the track to each of its artists (with position, to preserve artist order for multi-artist tracks).
+5. **Log** what was added on each poll, and continue on error rather than crashing the service.
 
-## 2. Table generation and maintenance
+## Database schema
 
-Once authenticated with the Spotify API, we need to create/maintain the table used to store our listens to. Here is SQLite3 snippet to initiate/maintain the table:
+Four tables, defined in `schema.sql`:
 
-<img width="588" height="492" alt="image" src="https://github.com/user-attachments/assets/59ee12ea-8d69-4799-8ec4-b2280e2f29a5" />
-<br></br
+| Table | Purpose |
+|---|---|
+| `albums` | One row per album (id, name, release date, artwork URL, etc.) |
+| `tracks` | One row per play, keyed by `played_at` so repeat plays of the same track are stored separately |
+| `artists` | One row per artist |
+| `track_artists` | Junction table linking tracks to artists, preserving artist order for collaborations |
 
-Some design choices were taken here, but for the most part, this is essentially everything that is fed by that APIs endpoint. It is possible that there could be multiple artists that are credited on a song, in that case, we handle this by serving five columns for artists. Additionally, the start_timestamp is served in milliseconds, I am transforming this before storage into a datetime that is stored as a text.
+Indexes are set on `artist_id`, `album_id`, `played_at`, and `track_id` to keep lookups fast as the history grows.
 
-## 3. API idle handling
+## Project structure
 
-To be friendly and avoid rate-limiting when there is nothing playing, I implemented some logic that will detect when nothing is playing then count the idle time to adjust the sleep timing based on the idle_count. You can see this here:
+```
+spotify-listener/
+├── app.py              # Main polling service
+├── schema.sql           # Database schema
+├── requirements.txt     # Python dependencies
+├── Dockerfile            # Container definition
+├── LICENSE
+└── scripts/              # Exploratory utilities used during development
+    ├── spotify-kpis.py      # Prints top artists/tracks from Spotify's "top items" endpoint
+    ├── readDatabase.py      # Dumps the full contents of a local database for inspection
+    ├── read database.py     # Read-only dump of a spotify_history.db table
+    └── testPythonScript.py  # Scratch script for exploring the raw API response shape
+```
 
-<img width="533" height="242" alt="image" src="https://github.com/user-attachments/assets/1e7bbd6b-f8aa-4edf-95c2-d66851e1707d" />
-<br></br>
+The `scripts/` folder holds one-off scripts used while building and debugging the pipeline. They aren't wired into the main service and some reference different database files or environment variable names than `app.py`.
 
+## Setup
 
-## 4. Grabbing the data from the API endpoint
+### Prerequisites
 
-We are now ready to assign the API endpoints to variables that we will append to a list and then using SQLite3, insert that list to the table. Here is the chunk of the script that handles assigning the API endpoints to variables that we can store:
+- Python 3.12+, or Docker
+- A Spotify Developer app (client ID and secret) from the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard), with a redirect URI registered
 
-<img width="722" height="538" alt="image" src="https://github.com/user-attachments/assets/efd31c62-a97f-498e-acbc-a2b084dd67fd" />
-<br></br>
+### 1. Clone and configure
 
-## 5. Validate and store the data to table
+```bash
+git clone https://github.com/GarrettMeldrum/spotify-listener.git
+cd spotify-listener
+```
 
-Once we have assigned the variables to the API endpoints, we are ready to validate that this is new data and store it to our table. The way we are handling the validation that the data is new is by checking the track_id of the last stored row. Here is the code:
+Create a `.env` file in the project root:
 
-<img width="949" height="757" alt="image" src="https://github.com/user-attachments/assets/7c5a502e-84a2-4615-81a8-df7be96eea95" />
-<br></br>
+```
+SPOTIFY_CLIENT_ID=your_client_id
+SPOTIFY_CLIENT_SECRET=your_client_secret
+SPOTIFY_REDIRECT_URI=your_redirect_uri
+DB=data/spotify_history.db
+```
 
-Once the validation is checked, we are running an insert for the list of stored variables.
+### 2. Run locally
 
-## 6. Exception handling 
+```bash
+pip install -r requirements.txt
+python app.py
+```
 
-Exception handling is basic and is still being thought through fully. Currently, if an exception is raised, it backs off for minimum 30 seconds and retrys. Here is the snippet:
+On first run, Spotipy opens the OAuth flow and caches the resulting token. Note that the cache path is currently hardcoded to `/app/data/.cache` in `app.py`, so when running outside Docker, create that directory relative to your working directory (`mkdir -p app/data`) or update the path before running.
 
-<img width="654" height="299" alt="image" src="https://github.com/user-attachments/assets/1f55397e-4b18-4b19-a664-a49b8ae0c0dd" />
-<br></br>
+### 3. Run with Docker
 
+```bash
+docker build -t spotify-listener .
+docker run -d \
+  --name spotify-listener \
+  --env-file .env \
+  -v $(pwd)/data:/app/data \
+  spotify-listener
+```
 
+Mounting `/app/data` persists both the SQLite database and the OAuth token cache across container restarts.
 
+## Roadmap
+
+- Dashboard for visualizing listening history on a personal website
+- Real-time streaming of new plays to the front end
+- More robust retry and backoff handling for API errors
+
+## License
+
+MIT. See [LICENSE](LICENSE).
